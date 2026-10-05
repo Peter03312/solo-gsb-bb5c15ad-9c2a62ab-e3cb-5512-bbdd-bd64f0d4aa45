@@ -260,6 +260,23 @@ def _withdrawal_view(row):
     }
 
 
+def _deletion_view(row):
+    """删除凭据视图 (会务方追溯; 含删除瞬间冻结的发布序号/槽位与失效计数)。"""
+    return {
+        "id": row["id"],
+        "paper_id": row["paper_id"],
+        "state": "deleted",
+        "revision": row["revision"],
+        "deleted_at": row["deleted_at"],
+        "published_serial": row["published_serial"],
+        "published_plan": (
+            json.loads(row["published_plan_json"]) if row["published_plan_json"] is not None else None
+        ),
+        "invalidated_snapshots": row["invalidated_snapshots"],
+        "expired_objections": row["expired_objections"],
+    }
+
+
 def _reviewer_row_to_dict(row):
     return {
         "reviewer_id": row["reviewer_id"],
@@ -538,6 +555,23 @@ def update_paper(paper_id: str, body: PaperUpdate, _: bool = Depends(require_org
 
 @app.delete("/papers/{paper_id}")
 def delete_paper(paper_id: str, _: bool = Depends(require_organizer)):
+    """会务方删除一篇现存论文。
+
+    删除在同一个写事务 (BEGIN IMMEDIATE) 内原子完成反馈生命周期收尾:
+      - 该稿此前发布的全部反馈快照访问码立即失效 (invalidated=1, 快照行保留):
+        持码读取评语与持码提交新异议统一按无效/已失效同形 404 拒绝,
+        不透露论文是否存在;
+      - 仍 pending 的作者异议原子标记 expired (已驳回/受理/既过期终态不变),
+        作者的随机查询凭据仍可随时查询处理状态, 全部历史供会务方追溯;
+      - 普通分配锁定行、评审保障等级行随论文级联清除 (删除稿不再参与求解);
+      - 删除凭据 (时刻/修订号/冻结发布序号与槽位/失效快照数/过期异议数) 落
+        paper_deletions: 同编号重新录入后, 删除时刻之前的旧快照继续失效,
+        旧访问码绝不恢复效力 (会务方可经 /papers/{id}/deletions 与
+        /papers/deletions 追溯每次删除)。
+    未知论文 404; 已撤回论文 409 (撤回稿资料行保留, 不可删除)。删除推进资料
+    修订号 +1; 当前发布版与发布序号不变。
+    """
+    now = datetime.now(timezone.utc).isoformat()
     with db.write_txn() as conn:
         row = conn.execute(
             "SELECT withdrawn FROM papers WHERE paper_id = ?", (paper_id,)
@@ -549,16 +583,61 @@ def delete_paper(paper_id: str, _: bool = Depends(require_organizer)):
                 status_code=409,
                 detail=f"论文 {paper_id} 已撤回, 撤回稿不可删除 (资料与评审痕迹保留供追溯)",
             )
+        # 冻结删除瞬间的发布状态供会务方追溯 (当前发布版不修改、不推进发布序号)
+        published = _load_published(conn)
+        frozen_serial = None
+        frozen_plan = None
+        if published is not None:
+            pair = json.loads(published["plan"]).get(paper_id)
+            if pair is not None:
+                frozen_serial = published["serial"]
+                frozen_plan = json.dumps(pair, ensure_ascii=False)
+
         cur = conn.execute("DELETE FROM papers WHERE paper_id = ?", (paper_id,))
         if cur.rowcount == 0:
             raise HTTPException(status_code=404, detail=f"论文不存在: {paper_id}")
+        # 反馈生命周期原子收尾 (同一写事务): 旧快照访问码失效 + 待处理异议过期
+        invalidated_snapshots = db.invalidate_snapshots_for_paper_deletion(conn, paper_id)
+        expired_objections = db.expire_pending_objections_for_paper(conn, paper_id, now)
         # 论文删除后不再参与分配, 其普通分配锁定随论文一并清除 (非"悄悄释放":
         # 被锁对象已不存在; 评审人删除不级联, 锁定保留并在预演/发布中暴露);
         # 评审保障等级行同样随论文级联清除 (删除稿不再参与求解)
         conn.execute("DELETE FROM assignment_locks WHERE paper_id = ?", (paper_id,))
         conn.execute("DELETE FROM paper_guarantee_levels WHERE paper_id = ?", (paper_id,))
         rev = db.bump_revision(conn)
-    return {"ok": True, "paper_id": paper_id, "revision": rev}
+        ins = conn.execute(
+            "INSERT INTO paper_deletions"
+            "(paper_id, revision, published_serial, published_plan_json,"
+            " invalidated_snapshots, expired_objections, deleted_at)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (
+                paper_id,
+                rev,
+                frozen_serial,
+                frozen_plan,
+                invalidated_snapshots,
+                expired_objections,
+                now,
+            ),
+        )
+        deletion_id = ins.lastrowid
+    return {
+        "ok": True,
+        "paper_id": paper_id,
+        "revision": rev,
+        "invalidated_snapshots": invalidated_snapshots,
+        "expired_objections": expired_objections,
+        "deletion": {
+            "id": deletion_id,
+            "paper_id": paper_id,
+            "revision": rev,
+            "published_serial": frozen_serial,
+            "published_plan": json.loads(frozen_plan) if frozen_plan is not None else None,
+            "invalidated_snapshots": invalidated_snapshots,
+            "expired_objections": expired_objections,
+            "deleted_at": now,
+        },
+    }
 
 
 @app.get("/papers")
@@ -725,6 +804,47 @@ def get_paper_withdrawal(paper_id: str, _: bool = Depends(require_organizer)):
                 status_code=404, detail=f"论文 {paper_id} 不存在或尚未撤回"
             )
     return {"paper_id": paper_id, "state": "withdrawn", "withdrawal": _withdrawal_view(record)}
+
+
+# ------------------------------------------------ 论文删除凭据 (会务方追溯)
+
+@app.get("/papers/deletions")
+def list_paper_deletions(
+    paper_id: str | None = Query(default=None),
+    _: bool = Depends(require_organizer),
+):
+    """会务方查看论文删除凭据 (全部删除事件, 含"删除后同编号重新录入"的历史)。
+
+    每条记录含删除时刻、推进后的资料修订号、冻结的发布序号与槽位、本次失效的
+    快照数与过期异议数; 这些记录同时是迁移恢复时重算访问码效力的凭据。
+    可选 ?paper_id= 仅查看某编号 (可多次删除/重录, 按删除顺序返回)。
+    """
+    with db.read_txn() as conn:
+        if paper_id is not None:
+            rows = db.load_paper_deletions(conn, paper_id)
+        else:
+            rows = conn.execute(
+                "SELECT id, paper_id, revision, published_serial, published_plan_json,"
+                " invalidated_snapshots, expired_objections, deleted_at"
+                " FROM paper_deletions ORDER BY id"
+            ).fetchall()
+    return {"deletions": [_deletion_view(r) for r in rows]}
+
+
+@app.get("/papers/{paper_id}/deletions")
+def get_paper_deletions(paper_id: str, _: bool = Depends(require_organizer)):
+    """会务方按编号查看全部删除凭据 (同编号可多次"删除 -> 重录", 按删除顺序)。
+
+    该编号从未删除过 (含从未录入) 统一 404; 已删除但尚未重录的论文同样可查
+    (删除凭据不随论文资料行删除, 长期保留供会务方追溯)。
+    """
+    with db.read_txn() as conn:
+        rows = db.load_paper_deletions(conn, paper_id)
+        if not rows:
+            raise HTTPException(
+                status_code=404, detail=f"论文 {paper_id} 不存在或从未被删除"
+            )
+    return {"paper_id": paper_id, "deletions": [_deletion_view(r) for r in rows]}
 
 
 # ------------------------------------------------ 论文评审保障等级 (会务方)
@@ -1990,7 +2110,7 @@ def publish_feedback_snapshot(
             " WHERE paper_id = ? AND serial = ? AND receipt1 = ? AND receipt2 = ?",
             (paper_id, current_serial, receipt1, receipt2),
         ).fetchone()
-        if existing is not None:
+        if existing is not None and not existing["invalidated"]:
             return {
                 "ok": True,
                 "paper_id": paper_id,
@@ -2000,6 +2120,22 @@ def publish_feedback_snapshot(
                 "changed": False,
                 "snapshot": _snapshot_public(existing),
             }
+        if existing is not None:
+            # 同 (论文, 序号, 两份评语收据) 的旧版本已失效且永不复活: 论文曾被删除
+            # (同编号重新录入) 使该版随删除失效。重新发布需先重新发布分配 (推进
+            # 发布序号) 或让评语产生新收据; 绝不返回旧访问码、不覆盖历史版本行。
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": (
+                        "该论文此前已被删除 (后又以同编号重新录入): 相同发布序号与评语收据的"
+                        " 旧快照版本已随删除永久失效, 旧访问码不恢复效力; 请重新发布分配"
+                        " (推进发布序号) 后再发布快照, 系统将生成新版本与新访问码"
+                    ),
+                    "paper_id": paper_id,
+                    "invalidated_version": existing["version"],
+                },
+            )
         version = conn.execute(
             "SELECT COALESCE(MAX(version), 0) + 1 AS v"
             " FROM feedback_snapshots WHERE paper_id = ?",
@@ -3122,9 +3258,9 @@ def restore_migration_snapshot(body: dict = Body(...), _: bool = Depends(require
       历史内容供会务方追溯); 恢复本身不推进修订号与发布序号。
     """
     try:
-        migration.validate_envelope(body)
+        format_version = migration.validate_envelope(body)
         data = body["data"]
-        migration.validate_snapshot(data)
+        migration.validate_snapshot(data, format_version=format_version)
     except migration.SnapshotValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
     now = datetime.now(timezone.utc).isoformat()
@@ -3140,12 +3276,12 @@ def restore_migration_snapshot(body: dict = Body(...), _: bool = Depends(require
             raise HTTPException(
                 status_code=422, detail=f"快照内容违反存储约束, 恢复拒绝: {exc}"
             )
-        migration.record_restore(conn, body["checksum"], data, now)
+        migration.record_restore(conn, body["checksum"], data, now, format_version)
     published = data["published"]
     return {
         "ok": True,
         "restored": True,
-        "format_version": migration.FORMAT_VERSION,
+        "format_version": format_version,
         "checksum": body["checksum"],
         "revision": data["revision"],
         "serial": published["serial"] if published is not None else None,

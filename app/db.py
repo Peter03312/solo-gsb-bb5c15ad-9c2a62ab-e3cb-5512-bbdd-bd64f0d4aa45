@@ -43,6 +43,14 @@
   paper_withdrawals 表每篇撤回稿至多一行, 保存非空撤回原因、推进后的资料修订号、
   撤回时间及撤回瞬间的发布序号与槽位 (供追溯); 匹配当前修订号的同原因重试幂等
   返回原记录 (不推进修订号), 异原因/版本不符拒绝且无部分改动。
+- paper_deletions 表保存会务方删除论文的失效凭据 (与撤回不同: 删除不保留论文
+  资料行, 同编号允许重新录入)。删除在同一个写事务内生效——该稿此前发布的全部
+  反馈快照访问码立即失效 (feedback_snapshots.invalidated=1), 仍 pending 的作者
+  异议原子标记 expired; 同编号重新录入后, 删除时刻 (deleted_at) 之前创建的旧
+  快照继续保持失效, 旧访问码绝不恢复效力。同一编号可多次"删除 -> 重录",
+  每次删除追加一行; 删除行还冻结删除瞬间的发布序号与槽位、本次失效快照数/过期
+  异议数, 既是会务方追溯依据, 也是迁移恢复时跨记录重算访问码效力的凭据
+  (仅靠快照自报 invalidated 标记无法防止被改回有效的伪造快照)。
 - paper_guarantee_levels 表保存会务方按论文设置的评审保障等级 (high/medium;
   未设置即普通 normal, 不落行, 设置为 normal 即清除该行): 仅在普通分配/补位
   无法完整覆盖各自目标论文时参与求解——先使完整分配的论文总数最大, 再依次使
@@ -172,7 +180,7 @@ CREATE TABLE IF NOT EXISTS feedback_snapshots (
     review1      TEXT NOT NULL,   -- 冻结 JSON: {"score":..,"comment":..}
     review2      TEXT NOT NULL,   -- 冻结 JSON: {"score":..,"comment":..}
     created_at   TEXT NOT NULL,
-    invalidated  INTEGER NOT NULL DEFAULT 0,  -- 1=更正请求发起后访问码立即失效
+    invalidated  INTEGER NOT NULL DEFAULT 0,  -- 1=更正请求发起/撤回/删除论文后访问码立即失效
     UNIQUE (paper_id, serial, receipt1, receipt2)
 );
 -- 会务方提交的机构归并边 (同一机构的不同原名)。归并关系传递且不可拆分:
@@ -233,8 +241,8 @@ CREATE TABLE IF NOT EXISTS review_corrections (
 -- accepted: 会务方受理 (受理时原子核对发布序号仍为当前序号、目标评语收据未变、
 --   无既有待更正请求, 按匿名标号定位评审人并走既有更正请求流程, 快照访问码
 --   随之立即失效, 关联更正请求 id);
--- expired: 发布序号变化 (普通发布/补位发布) 时仍未处理的异议在同一事务内
---   原子过期, 历史永久保留供会务方追溯。
+-- expired: 发布序号变化 (普通发布/补位发布) 或论文撤回/删除时仍未处理的异议
+--   在同一事务内原子过期, 历史永久保留供会务方追溯。
 CREATE TABLE IF NOT EXISTS feedback_objections (
     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
     snapshot_id        INTEGER NOT NULL,    -- 异议所针对的快照版本
@@ -268,6 +276,25 @@ CREATE TABLE IF NOT EXISTS paper_withdrawals (
     published_serial    INTEGER,             -- 撤回瞬间的发布序号 (从未发布为 NULL)
     published_plan_json TEXT,                -- 撤回瞬间该稿的槽位 JSON: [评审人编号 ...]
     withdrawn_at        TEXT NOT NULL
+);
+-- 论文删除凭据 (会务方 DELETE /papers/{id}; 与撤回不同: 资料行删除, 同编号可重录)。
+-- 每次删除在同一个写事务内追加一行, 同时:
+--   * 该稿此前的全部反馈快照访问码置 invalidated=1 (行保留供会务方追溯);
+--   * 仍 pending 的作者异议原子标记 expired (查询凭据仍可查状态);
+--   * 普通分配锁定行/保障等级行随论文删除级联清除。
+-- 同编号重新录入后, deleted_at 之前创建的旧快照继续失效 (旧码不复活); 重录后
+-- 若再次删除则再追加一行。冻结删除瞬间的发布序号与槽位、失效快照数/过期异议数
+-- 供会务方追溯; 迁移恢复时删除行是跨记录重算访问码效力的凭据
+-- (伪造快照仅把 invalidated 改回 0 无法通过恢复核验)。
+CREATE TABLE IF NOT EXISTS paper_deletions (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    paper_id             TEXT NOT NULL,
+    revision             INTEGER NOT NULL,    -- 删除推进后的资料修订号
+    published_serial     INTEGER,             -- 删除瞬间的发布序号 (从未发布为 NULL)
+    published_plan_json  TEXT,                -- 删除瞬间该稿的槽位 JSON: [评审人编号 ...]
+    invalidated_snapshots INTEGER NOT NULL,   -- 本次失效的快照版数
+    expired_objections   INTEGER NOT NULL,    -- 本次过期的待处理异议数
+    deleted_at           TEXT NOT NULL
 );
 -- 论文评审保障等级 (会务方按论文设置, 仅约束"无法完整覆盖"时的求解优先次序)。
 -- 每篇论文至多一行, 仅保存 high/medium; 未设置即普通 normal (不落行,
@@ -485,6 +512,44 @@ def expire_pending_objections_for_paper(
         " WHERE state = 'pending' AND paper_id = ?",
         (now, paper_id),
     ).rowcount
+
+
+def latest_paper_deletion_at(conn: sqlite3.Connection, paper_id: str) -> str | None:
+    """某编号最近一次删除的时刻 (UTC); 从未删除过返回 None。
+
+    同编号重新录入后, 删除时刻 (含同一事务内失效的快照) 之前创建的旧快照
+    继续失效; 重录之后发布的新快照创建时刻严格晚于该时刻, 不受影响。
+    """
+    row = conn.execute(
+        "SELECT MAX(deleted_at) AS at FROM paper_deletions WHERE paper_id = ?",
+        (paper_id,),
+    ).fetchone()
+    return row["at"] if row is not None else None
+
+
+def invalidate_snapshots_for_paper_deletion(
+    conn: sqlite3.Connection, paper_id: str
+) -> int:
+    """删除论文时, 在同一写事务内把该稿此前全部未失效快照访问码置失效。
+
+    旧版/当前版统一失效, 快照行保留供会务方追溯; 返回本次失效的版数。
+    持码读取与异议提交沿用无效码/已失效码同形的 404, 不透露论文是否存在。
+    """
+    return conn.execute(
+        "UPDATE feedback_snapshots SET invalidated = 1"
+        " WHERE paper_id = ? AND invalidated = 0",
+        (paper_id,),
+    ).rowcount
+
+
+def load_paper_deletions(conn: sqlite3.Connection, paper_id: str):
+    """按删除顺序读取某编号的全部删除凭据 (会务方追溯)。"""
+    return conn.execute(
+        "SELECT id, paper_id, revision, published_serial, published_plan_json,"
+        " invalidated_snapshots, expired_objections, deleted_at"
+        " FROM paper_deletions WHERE paper_id = ? ORDER BY id",
+        (paper_id,),
+    ).fetchall()
 
 
 @contextmanager
