@@ -43,6 +43,15 @@
   paper_withdrawals 表每篇撤回稿至多一行, 保存非空撤回原因、推进后的资料修订号、
   撤回时间及撤回瞬间的发布序号与槽位 (供追溯); 匹配当前修订号的同原因重试幂等
   返回原记录 (不推进修订号), 异原因/版本不符拒绝且无部分改动。
+- paper_deletions 表保存会务方删除论文 (DELETE /papers/{id}) 的可核验失效依据:
+  每次删除在同一个写事务内写入一行 (同编号可多次删除: 删除后允许同编号重新录入),
+  删除同事务令该稿全部反馈快照访问码失效 (feedback_snapshots.invalidated=1)、
+  待处理作者异议原子标记 expired, 并冻结删除瞬间的发布序号/槽位与推进后的修订号;
+  快照行、异议行、评语/决定/更正等全部历史不删除, 供会务方按论文编号追溯。
+  该表是迁移恢复时"删除失效依据"的跨记录核验来源: 不晚于删除时刻创建的该稿快照
+  必已随删除失效, 当前不存在的资料行 (终态删除) 的全部快照也必须失效——
+  因此同编号重新录入不会恢复旧码效力 (旧行 invalidated=1), 且把旧快照标记
+  改回有效并重算校验和的伪造快照会因删除记录而被拒绝 (矛盾快照 422)。
 - paper_guarantee_levels 表保存会务方按论文设置的评审保障等级 (high/medium;
   未设置即普通 normal, 不落行, 设置为 normal 即清除该行): 仅在普通分配/补位
   无法完整覆盖各自目标论文时参与求解——先使完整分配的论文总数最大, 再依次使
@@ -269,6 +278,26 @@ CREATE TABLE IF NOT EXISTS paper_withdrawals (
     published_plan_json TEXT,                -- 撤回瞬间该稿的槽位 JSON: [评审人编号 ...]
     withdrawn_at        TEXT NOT NULL
 );
+-- 论文删除记录 (会务方 DELETE /papers/{id}; 同编号重新录入后可再次删除, 故按 id
+-- 保留全部历史, 不以 paper_id 为主键)。删除在同一个写事务内生效:
+-- 该稿全部反馈快照访问码失效 (feedback_snapshots.invalidated=1, 旧版/当前版统一),
+-- 仍 pending 的作者异议原子标记 expired; 快照、异议、评语/决定/回避/更正历史均不
+-- 删除, 冻结删除瞬间的发布序号与槽位供会务方追溯; 普通分配锁定行与评审保障等级行
+-- 随删除级联清除; 删除推进资料修订号 +1, 当前发布版与发布序号不变。
+-- 本表同时是实例迁移恢复时访问码效力的跨记录核验依据: 不晚于 deleted_at 创建的
+-- 该稿快照必已随该次删除失效; 资料行当前不存在 (终态删除) 的快照无论创建时刻均须
+-- 失效。同编号重新录入只产生一条新的资料行, 旧删除记录与旧快照失效标记仍在,
+-- 旧访问码不会恢复效力。
+CREATE TABLE IF NOT EXISTS paper_deletions (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    paper_id             TEXT NOT NULL,
+    revision             INTEGER NOT NULL,    -- 删除推进后的资料修订号
+    published_serial     INTEGER,             -- 删除瞬间的发布序号 (从未发布为 NULL)
+    published_plan_json  TEXT,                -- 删除瞬间该稿的槽位 JSON: [评审人编号 ...]
+    invalidated_snapshots INTEGER NOT NULL,   -- 本次删除失效的快照版数 (核验依据)
+    expired_objections   INTEGER NOT NULL,    -- 本次删除过期的待处理异议数 (核验依据)
+    deleted_at           TEXT NOT NULL
+);
 -- 论文评审保障等级 (会务方按论文设置, 仅约束"无法完整覆盖"时的求解优先次序)。
 -- 每篇论文至多一行, 仅保存 high/medium; 未设置即普通 normal (不落行,
 -- 设置为 normal 即清除该行)。等级仅在普通分配/补位无法完整覆盖各自目标论文时
@@ -332,6 +361,16 @@ def _migrate(conn: sqlite3.Connection) -> None:
         # 既有论文均未撤回
         conn.execute(
             "ALTER TABLE papers ADD COLUMN withdrawn INTEGER NOT NULL DEFAULT 0"
+        )
+    # 旧库数据对齐: 运行时持码读取/异议提交本就只认当前发布序号, 旧序号快照访问码
+    # 一律 404; 早期版本未把这种失效落进 invalidated 标记。补齐标记使库内状态与
+    # 运行时口径一致 (旧序号行保留供会务方追溯), 也使迁移恢复的跨记录核验成立。
+    current = conn.execute("SELECT serial FROM published WHERE id = 1").fetchone()
+    if current is not None and current["serial"] > 0:
+        conn.execute(
+            "UPDATE feedback_snapshots SET invalidated = 1"
+            " WHERE serial < ? AND invalidated = 0",
+            (current["serial"],),
         )
 
 
@@ -469,6 +508,22 @@ def expire_pending_objections(conn: sqlite3.Connection, new_serial: int, now: st
         "UPDATE feedback_objections SET state = 'expired', decided_at = ?"
         " WHERE state = 'pending' AND serial < ?",
         (now, new_serial),
+    ).rowcount
+
+
+def invalidate_snapshots_before_serial(conn: sqlite3.Connection, new_serial: int) -> int:
+    """发布序号推进为 new_serial 时, 在同一写事务内失效旧序号的反馈快照访问码。
+
+    持码读取/异议提交的运行时口径本就只认当前发布序号 (旧序号码一律 404);
+    这里把旧序号快照行的 invalidated 置 1, 使库内"失效标记"与运行时口径一致——
+    该标记是迁移恢复时访问码效力的跨记录核验依据, 不能只由"当前序号"在目标实例
+    重算 (伪造者可改快照序号而不动标记)。旧序号快照行保留供会务方追溯。
+    返回本次置失效的版数。
+    """
+    return conn.execute(
+        "UPDATE feedback_snapshots SET invalidated = 1"
+        " WHERE serial < ? AND invalidated = 0",
+        (new_serial,),
     ).rowcount
 
 

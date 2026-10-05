@@ -5,8 +5,9 @@
 - 快照覆盖全部现存业务记录: 论文 (含已撤回) 与评审人资料 (含评审人凭据)、
   资格变更记录、硬回避、资料修订号与当前发布版 (发布序号/方案/解释)、
   普通分配锁定表、机构归并边、评审保障等级、统一评审截止、论文撤回记录、
-  评审人决定、正式评语、评语更正记录、匿名反馈快照 (含访问码) 与作者异议
-  (含查询凭据); 不包含会务方密钥 (密钥是实例本地配置, 不属于业务数据);
+  论文删除记录 (删除即失效的可核验依据)、评审人决定、正式评语、评语更正记录、
+  匿名反馈快照 (含访问码) 与作者异议 (含查询凭据); 不包含会务方密钥
+  (密钥是实例本地配置, 不属于业务数据);
 - 快照附格式版本 (format/format_version) 与内容校验和 (checksum,
   对 data 的规范化 JSON 取 SHA-256), 供恢复方核对格式与内容完整性。
 
@@ -20,12 +21,16 @@
 - **访问码效力的跨记录核验** (防"旧快照失效标记被改回有效并重算校验和"的伪造快照):
   不只看 feedback_snapshots.invalidated 标记本身, 而是依据快照版本 (同论文同发布
   序号内仅最高版本可能有效)、评语更正请求 (不晚于更正请求发起时刻创建的快照必已
-  随请求失效; 组内存在待完成更正请求时全部失效) 与论文撤回记录 (撤回稿全部快照
-  失效) 重算每个访问码的应有效力, 并与快照标记逐行比对; 对当前发布序号上仍标记
+  随请求失效; 组内存在待完成更正请求时全部失效)、论文撤回记录 (撤回稿全部快照
+  失效) 与**论文删除记录** (格式 v2: 不晚于删除时刻创建的该稿快照必已随删除失效;
+  资料行当前不存在即终态删除时, 该稿快照无论创建时刻均须失效; 同编号重录不恢复
+  旧码) 重算每个访问码的应有效力, 并与快照标记逐行比对; 对当前发布序号上仍标记
   有效的快照, 还要其两份评语收据与当前发布方案槽位上的现行评语收据一致 (更正会
   原地更换收据, 故仅凭改标记/改时间无法让旧快照复活)。任何不一致即"矛盾快照"
-  422 拒绝; 合法的连续更正、同序号再次发布与跨发布序号历史快照均可迁移, 恢复后
-  仅当前有效码可读快照并提交异议, 历史内容仍供会务方追溯;
+  422 拒绝; 合法的连续更正、同序号再次发布、删除/重录与跨发布序号历史快照均可
+  迁移, 恢复后仅当前有效码可读快照并提交异议, 历史内容仍供会务方追溯;
+- **旧格式快照 (format_version=1) 未记载删除历史: 沿用原有恢复判断**,
+  不依据 (缺失的) 删除记录推断删除失效; v2 才做删除跨记录核验;
 - 仅接受尚无业务记录 (全部业务表为空且资料修订号为 0) 且从未恢复过的目标实例;
   校验失败 (422)、目标非空或重复恢复 (409) 一律拒绝且不留下部分数据——
   全部写入在同一个 BEGIN IMMEDIATE 写事务内完成, 任一失败整体回滚;
@@ -41,8 +46,18 @@ import sqlite3
 from . import db
 
 # 快照格式标识与当前支持的格式版本
+#
+# 版本历史:
+#   1 — 初始格式 (不含 paper_deletions): 访问码效力仅依据快照版本链、评语更正请求
+#       与论文撤回记录重算。恢复 v1 快照时**沿用原有恢复判断, 不推断删除历史**
+#       (旧格式未记载删除失效依据)。
+#   2 — 新增 paper_deletions (论文删除记录): 删除时同事务失效该稿全部访问码并使
+#       待处理异议过期, 删除记录是该失效的可核验跨记录依据——不晚于删除时刻创建的
+#       该稿快照必已失效; 资料行当前不存在 (终态删除) 的快照无论创建时刻均须失效。
 FORMAT = "review-assignment-migration"
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
+# 恢复方接受的格式版本: 当前版本 + 旧版本 (旧版本沿用旧恢复判断, 不推断删除)
+SUPPORTED_FORMAT_VERSIONS = (1, 2)
 
 # 业务表 (恢复目标空性检查 = 这些表全部为空且资料修订号为 0;
 # migration_restores 是实例本地元数据, 不属于业务数据)
@@ -60,6 +75,7 @@ BUSINESS_TABLES = (
     "review_corrections",
     "feedback_objections",
     "paper_withdrawals",
+    "paper_deletions",
     "paper_guarantee_levels",
     "review_deadlines",
 )
@@ -78,10 +94,14 @@ _LIST_TABLES = (
     "review_corrections",
     "feedback_objections",
     "paper_withdrawals",
+    "paper_deletions",
     "paper_guarantee_levels",
     "review_deadlines",
 )
 
+_DATA_KEYS_V1 = ("revision", "published") + tuple(
+    t for t in _LIST_TABLES if t != "paper_deletions"
+)
 _DATA_KEYS = ("revision", "published") + _LIST_TABLES
 
 
@@ -329,6 +349,27 @@ def collect_snapshot(conn: sqlite3.Connection) -> dict:
             " FROM paper_withdrawals ORDER BY paper_id"
         ).fetchall()
     ]
+    data["paper_deletions"] = [
+        {
+            "id": r["id"],
+            "paper_id": r["paper_id"],
+            "revision": r["revision"],
+            "published_serial": r["published_serial"],
+            "published_plan": (
+                json.loads(r["published_plan_json"])
+                if r["published_plan_json"] is not None
+                else None
+            ),
+            "invalidated_snapshots": r["invalidated_snapshots"],
+            "expired_objections": r["expired_objections"],
+            "deleted_at": r["deleted_at"],
+        }
+        for r in conn.execute(
+            "SELECT id, paper_id, revision, published_serial, published_plan_json,"
+            " invalidated_snapshots, expired_objections, deleted_at"
+            " FROM paper_deletions ORDER BY id"
+        ).fetchall()
+    ]
     data["paper_guarantee_levels"] = [
         {
             "paper_id": r["paper_id"],
@@ -405,18 +446,22 @@ def _check_frozen_review(value, where: str):
     )
 
 
-def validate_envelope(body) -> None:
-    """核对恢复请求信封: 格式标识、格式版本、内容校验和 (不核对 data 内部结构)。"""
+def validate_envelope(body) -> int:
+    """核对恢复请求信封: 格式标识、格式版本、内容校验和 (不核对 data 内部结构)。
+
+    返回快照格式版本 (1 或 2): v1 为不含 paper_deletions 的旧格式, 恢复时沿用
+    原有恢复判断、不推断删除历史; v2 起含删除记录并做删除跨记录核验。
+    """
     if not isinstance(body, dict):
         raise SnapshotValidationError("恢复请求体必须是 JSON 对象 (导出的快照文件)")
     if body.get("format") != FORMAT:
         raise SnapshotValidationError(
             f"格式标识不符: 期望 {FORMAT!r}, 实际 {body.get('format')!r}"
         )
-    if body.get("format_version") != FORMAT_VERSION:
+    if body.get("format_version") not in SUPPORTED_FORMAT_VERSIONS:
         raise SnapshotValidationError(
             f"不支持的格式版本: {body.get('format_version')!r}"
-            f" (本实例支持 {FORMAT_VERSION})"
+            f" (本实例支持 {sorted(SUPPORTED_FORMAT_VERSIONS)})"
         )
     checksum = body.get("checksum")
     if not _is_nonempty_str(checksum) or not checksum.startswith("sha256:"):
@@ -428,10 +473,17 @@ def validate_envelope(body) -> None:
         raise SnapshotValidationError(
             "内容校验和不符: 快照已损坏或被篡改, 拒绝恢复"
         )
+    return body["format_version"]
 
 
-def validate_snapshot(data) -> None:
+def validate_snapshot(data, format_version: int = FORMAT_VERSION) -> None:
     """校验快照 data 的结构与记录引用 (符合历史保留规则)。
+
+    format_version:
+      - 1: 旧格式, data 不含 paper_deletions; 访问码效力沿用原有恢复判断
+        (快照版本链/更正请求/撤回记录), **不推断删除历史**;
+      - 2: 含 paper_deletions, 另做删除跨记录核验——删除记录与快照创建时刻、
+        资料行当前存在性共同重算每个访问码的应失效状态。
 
     历史保留规则: 决定/评语/硬回避/资格变更/更正/快照/异议等历史记录永不删除,
     可指向已被删除的论文或评审人, 因此不对这些记录做论文/评审人存在性要求;
@@ -440,25 +492,31 @@ def validate_snapshot(data) -> None:
     当前序号的决定/评语必须落在当前发布方案槽位上——这些不变量必须成立。
 
     访问码效力不接受快照自报的 invalidated 标记: 另由 快照版本链、评语更正请求的
-    发起时刻/待完成状态、论文撤回记录重算每个快照的应失效状态并逐行比对
-    (同论文同序号仅最高版本可能有效; 不晚于更正请求发起时刻创建的版本必已失效;
-    有待完成更正请求的组全部失效; 撤回稿全部失效); 当前发布序号上标记有效的快照,
-    其两份评语收据还必须等于当前方案槽位的现行评语收据。任一不一致即矛盾快照 422,
-    防止"改回失效标记并重算校验和"使旧访问码复活、再次读取已更正反馈或提交异议。
+    发起时刻/待完成状态、论文撤回记录 (v2 另加论文删除记录与资料行存在性)
+    重算每个快照的应失效状态并逐行比对 (同论文同序号仅最高版本可能有效;
+    不晚于更正请求发起时刻创建的版本必已失效; 有待完成更正请求的组全部失效;
+    撤回稿全部失效; v2: 不晚于删除时刻创建的快照必已失效, 终态删除稿的全部快照
+    无论何时创建均失效); 当前发布序号上标记有效的快照, 其两份评语收据还必须等于
+    当前方案槽位的现行评语收据。任一不一致即矛盾快照 422, 防止"改回失效标记并重
+    算校验和"使旧访问码复活、再次读取已更正反馈或已删除论文的反馈、提交异议。
     """
+    data_keys = _DATA_KEYS if format_version >= 2 else _DATA_KEYS_V1
+    list_tables = _LIST_TABLES if format_version >= 2 else tuple(
+        t for t in _LIST_TABLES if t != "paper_deletions"
+    )
     if not isinstance(data, dict):
         _fail("data", "必须是对象")
-    unknown = sorted(set(data) - set(_DATA_KEYS))
+    unknown = sorted(set(data) - set(data_keys))
     if unknown:
         _fail("data", f"含未知字段 {unknown}")
-    for key in _DATA_KEYS:
+    for key in data_keys:
         if key not in data:
             _fail("data", f"缺少字段 {key}")
 
     revision = data["revision"]
     if not _is_int(revision) or revision < 0:
         _fail("data.revision", "资料修订号必须是 >= 0 的整数")
-    for key in _LIST_TABLES:
+    for key in list_tables:
         if not isinstance(data[key], list):
             _fail(f"data.{key}", "必须是数组")
 
@@ -852,6 +910,40 @@ def validate_snapshot(data) -> None:
             f"已撤回论文缺少撤回记录: {sorted(missing)} (撤回与记录同事务写入)",
         )
 
+    # ---- 论文删除记录 (v2; 删除即失效的可核验依据, 历史保留可指向已重录/已删除论文)
+    # 同编号可多次删除 (删除后允许重新录入), 故按 id 保留全部记录, 不要求 paper_id
+    # 唯一; 删除记录不要求论文当前存在 (终态删除时资料行已不在 papers 中——
+    # 这正是"该稿全部快照必须失效"的核验输入之一)。
+    deletion_ids = set()
+    deletions_by_paper = {}
+    if format_version >= 2:
+        for d in data["paper_deletions"]:
+            where = "data.paper_deletions"
+            _check_fields(
+                d,
+                {
+                    "id": lambda v: _is_int(v) and v >= 1,
+                    "paper_id": _is_nonempty_str,
+                    "revision": _is_int,
+                    "published_serial": lambda v: v is None or (_is_int(v) and v >= 1),
+                    "published_plan": lambda v: v is None
+                    or (
+                        isinstance(v, list)
+                        and len(v) == 2
+                        and all(_is_nonempty_str(r) for r in v)
+                    ),
+                    "invalidated_snapshots": lambda v: _is_int(v) and v >= 0,
+                    "expired_objections": lambda v: _is_int(v) and v >= 0,
+                    "deleted_at": _is_nonempty_str,
+                },
+                where,
+            )
+            _check_unique(deletion_ids, d["id"], where, "删除记录 id")
+            _check_stamped_revision(d["revision"], where)
+            if d["published_serial"] is not None and d["published_serial"] > max_serial:
+                _fail(where, "删除冻结的发布序号超过当前发布序号")
+            deletions_by_paper.setdefault(d["paper_id"], []).append(d)
+
     # ---- 评审保障等级 (随论文删除/撤回级联清除: 必须指向现存未撤回论文)
     seen = set()
     for g in data["paper_guarantee_levels"]:
@@ -891,15 +983,19 @@ def validate_snapshot(data) -> None:
         _check_stamped_revision(dline["revision"], where)
         _check_unique(seen, dline["serial"], where, "截止行")
 
-    # ---- 跨记录核验: 访问码效力必须可由 快照版本/更正请求/撤回记录 重算
+    # ---- 跨记录核验: 访问码效力必须可由 快照版本/更正请求/撤回记录(/删除记录) 重算
     #
-    # 背景: 旧快照的失效 (更正请求发起、异议受理走更正流程、论文撤回) 在库中只体现为
-    # feedback_snapshots.invalidated=1。若有人导出后把该标记改回 0 并重算校验和,
-    # 仅核对标记本身会接受伪造快照, 旧访问码在目标实例将再次可读已更正的反馈、
-    # 甚至再次提交异议。因此恢复前必须依据其它业务记录重算每个访问码的应有效力,
-    # 标记与重算结果不一致即为"矛盾快照"。
+    # 背景: 旧快照的失效 (更正请求发起、异议受理走更正流程、论文撤回、论文删除)
+    # 在库中只体现为 feedback_snapshots.invalidated=1。若有人导出后把该标记改回 0
+    # 并重算校验和, 仅核对标记本身会接受伪造快照, 旧访问码在目标实例将再次可读
+    # 已更正/已删除论文的反馈、甚至再次提交异议。因此恢复前必须依据其它业务记录
+    # 重算每个访问码的应有效力, 标记与重算结果不一致即为"矛盾快照"。
     #
     # 效力规则 (与会话内运行时口径一致, 历史版本仅供会务方追溯):
+    #   0. [v2] 非当前发布序号的快照在库内标记上必须已失效: 普通发布/补位发布推进
+    #      serial 时, 旧序号访问码在同一事务置 invalidated=1 (v1 旧格式未落该标记,
+    #      沿用原有恢复判断, 不据此推断)。运行时无论 v1/v2 恢复结果, 都只认当前
+    #      发布序号, 旧序号码一律 404;
     #   1. 已撤回论文: 该稿全部快照失效 (撤回同事务失效所有访问码);
     #   2. 同 (论文, 发布序号) 内按版本仅最高一版可能有效: 同序号再次发布 version+1,
     #      旧版在更正请求发起时已被置失效;
@@ -907,6 +1003,12 @@ def validate_snapshot(data) -> None:
     #      (requested_at) 的版本, 已在请求发起的同一事务失效; 待更正期间不允许发布,
     #      故 pending 请求时组内全部失效; completed 请求之后的重发版本创建时间必晚于
     #      requested_at, 才可能有效;
+    #   4. 仅 v2 (旧格式未记载删除, 沿用原有判断, 不推断删除历史):
+    #      论文删除同事务失效该稿全部快照——快照创建不晚于任一删除记录的删除时刻
+    #      (deleted_at) 即必已随该次删除失效; 资料行当前不存在 (终态删除) 的论文,
+    #      其全部快照无论创建时刻均须失效。同编号重新录入不恢复旧码: 重录前的旧
+    #      快照 created_at 不晚于删除时刻; 重录后再次发布的新版本才可能有效, 且该
+    #      论文若再次被删除且未重录, 则连同新版本一并失效;
     # 时间戳只能辅助判定; 对当前发布序号上"标记有效"的快照, 还以现行评语收据核对
     # (更正会原地更换 submitted_reviews 的收据): 改标记/改时间而无对应收据, 复活不成立。
     snapshots = sorted(data["feedback_snapshots"], key=lambda s: s["id"])
@@ -938,6 +1040,10 @@ def validate_snapshot(data) -> None:
         if r["serial"] == max_serial:
             current_review_receipts[(r["paper_id"], r["reviewer_id"])] = r["receipt"]
 
+    # 重算得到的每个快照 id 的应失效状态, 供下面逐行比对, 并供"待处理异议必须指向
+    # 有效快照"的核验复用 (删除/撤回/序号变化后 pending 异议应已在同事务过期)。
+    expected_invalidated_by_id = {}
+
     for (pid, serial), group_snaps in groups.items():
         where = f"data.feedback_snapshots[paper_id={pid!r}, serial={serial}]"
         ordered = sorted(group_snaps, key=lambda s: s["version"])
@@ -946,10 +1052,21 @@ def validate_snapshot(data) -> None:
         has_pending = any(c["state"] == "pending" for c in corrections)
         # 最晚的更正请求发起时刻: 不晚于该时刻创建的版本已随请求发起而失效
         latest_requested_at = max(c["requested_at"] for c in corrections) if corrections else None
+        # v2: 该论文编号的最晚删除时刻; 论文资料行当前不存在 (终态删除) 时全部失效
+        paper_deletions = deletions_by_paper.get(pid, []) if format_version >= 2 else []
+        latest_deleted_at = (
+            max(d["deleted_at"] for d in paper_deletions) if paper_deletions else None
+        )
+        terminally_deleted = format_version >= 2 and pid not in paper_ids
 
         for s in ordered:
             expect_invalidated = False
             reasons = []
+            if format_version >= 2 and s["serial"] != max_serial:
+                # v2 起发布序号推进时旧序号快照在同一事务置 invalidated=1, 故标记必须
+                # 体现; v1 旧格式未做该落库, 沿用原有恢复判断 (不据此推断, 也不要求)。
+                expect_invalidated = True
+                reasons.append("快照发布序号不是当前发布序号 (序号推进时旧码即失效)")
             if pid in withdrawn_ids:
                 expect_invalidated = True
                 reasons.append("论文已撤回")
@@ -962,6 +1079,15 @@ def validate_snapshot(data) -> None:
             if latest_requested_at is not None and s["created_at"] <= latest_requested_at:
                 expect_invalidated = True
                 reasons.append("快照创建不晚于评语更正请求发起时刻 (请求发起时已失效)")
+            if terminally_deleted:
+                expect_invalidated = True
+                reasons.append("论文资料行当前不存在 (终态删除): 删除稿全部快照必须失效")
+            elif latest_deleted_at is not None and s["created_at"] <= latest_deleted_at:
+                expect_invalidated = True
+                reasons.append(
+                    "快照创建不晚于论文删除时刻 (删除同事务已失效, 同编号重录不恢复旧码)"
+                )
+            expected_invalidated_by_id[s["id"]] = expect_invalidated
             if bool(s["invalidated"]) != expect_invalidated:
                 if expect_invalidated:
                     _fail(
@@ -969,13 +1095,14 @@ def validate_snapshot(data) -> None:
                         f"快照版本 {s['version']} (访问码 {s['access_code']!r}) 的失效标记"
                         " 被置为有效, 但依据业务记录它应当已失效 ("
                         + "; ".join(reasons)
-                        + ")——已因更正或撤回失效的快照不能因仍属当前发布序号而复活",
+                        + ")——已因更正、撤回或删除失效的快照不能因仍属当前发布序号或"
+                        " 同编号重新录入而复活",
                     )
                 _fail(
                     where,
                     f"快照版本 {s['version']} (访问码 {s['access_code']!r}) 标记为已失效,"
-                    " 但无对应的失效记录 (撤回记录/更高版本/更正请求);"
-                    " 失效标记必须与快照版本、更正请求和撤回记录一致",
+                    " 但无对应的失效记录 (撤回/删除记录/更高版本/更正请求);"
+                    " 失效标记必须与快照版本、更正请求、撤回与删除记录一致",
                 )
 
             # 当前发布序号上标记有效的快照: 恢复后其访问码将立即可读、可提异议,
@@ -1004,6 +1131,22 @@ def validate_snapshot(data) -> None:
                             "现行评语收据不一致 (评语已被更正或替换却仍标记有效,"
                             " 旧访问码不得再次读取已更正的反馈)",
                         )
+
+    # v2: 待处理 (pending) 异议必须指向重算后仍有效的快照。删除/撤回/发布序号变化时,
+    # pending 异议已在同一写事务内原子 expired; 一条 pending 异议若指向按业务记录
+    # 应当失效的快照, 即与"删除即过期"的生命周期矛盾 (旧格式 v1 不记载删除记录,
+    # 沿用原有恢复判断, 不做本核验)。
+    if format_version >= 2:
+        for o in data["feedback_objections"]:
+            if o["state"] != "pending":
+                continue
+            if expected_invalidated_by_id.get(o["snapshot_id"], True):
+                _fail(
+                    "data.feedback_objections",
+                    f"待处理异议 id={o['id']} 指向已失效快照 "
+                    f"snapshot_id={o['snapshot_id']} (论文撤回/删除或发布序号变化时"
+                    " 待处理异议应已在同一事务过期)",
+                )
 
 
 # ---------------------------------------------------------------- 恢复
@@ -1243,6 +1386,28 @@ def load_snapshot(conn: sqlite3.Connection, data: dict) -> dict:
             ),
         )
     counts["paper_withdrawals"] = len(data["paper_withdrawals"])
+    for d in data.get("paper_deletions", []):  # 旧格式 v1 不含删除记录
+        conn.execute(
+            "INSERT INTO paper_deletions"
+            "(id, paper_id, revision, published_serial, published_plan_json,"
+            " invalidated_snapshots, expired_objections, deleted_at)"
+            " VALUES (?,?,?,?,?,?,?,?)",
+            (
+                d["id"],
+                d["paper_id"],
+                d["revision"],
+                d["published_serial"],
+                (
+                    json.dumps(d["published_plan"], ensure_ascii=False)
+                    if d["published_plan"] is not None
+                    else None
+                ),
+                d["invalidated_snapshots"],
+                d["expired_objections"],
+                d["deleted_at"],
+            ),
+        )
+    counts["paper_deletions"] = len(data.get("paper_deletions", []))
     for g in data["paper_guarantee_levels"]:
         conn.execute(
             "INSERT INTO paper_guarantee_levels(paper_id, level, revision, updated_at)"
@@ -1260,7 +1425,10 @@ def load_snapshot(conn: sqlite3.Connection, data: dict) -> dict:
     return counts
 
 
-def record_restore(conn: sqlite3.Connection, checksum: str, data: dict, restored_at: str) -> None:
+def record_restore(
+    conn: sqlite3.Connection, checksum: str, data: dict, restored_at: str,
+    format_version: int = FORMAT_VERSION,
+) -> None:
     """写入恢复标记 (同一恢复事务内): 使重复恢复被识别并拒绝。"""
     published = data["published"]
     conn.execute(
@@ -1269,7 +1437,7 @@ def record_restore(conn: sqlite3.Connection, checksum: str, data: dict, restored
         " VALUES (?,?,?,?,?)",
         (
             checksum,
-            FORMAT_VERSION,
+            format_version,
             data["revision"],
             published["serial"] if published is not None else 0,
             restored_at,
